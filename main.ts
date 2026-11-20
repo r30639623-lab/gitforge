@@ -233,7 +233,7 @@ function writePack(objects: readonly GitObject[]): Buffer {
   parts.push(header);
   for (const object of objects) {
     parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    parts.push(deflateSync(object.data, { level: 0 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
