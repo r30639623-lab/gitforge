@@ -160,6 +160,16 @@ const PKT_FLUSH = Buffer.from('0000', 'ascii');
 const PKT_DELIM = Buffer.from('0001', 'ascii');
 const PKT_RESPONSE_END = Buffer.from('0002', 'ascii');
 
+/** True when `s` is exactly 4 hex digits (a pkt-line length field). Faster than a regex. */
+function isHex4(s: string): boolean {
+  if (s.length !== 4) return false;
+  for (let i = 0; i < 4; i += 1) {
+    const c = s.charCodeAt(i);
+    if (!((c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70))) return false;
+  }
+  return true;
+}
+
 interface PktPacket {
   kind: 'data' | 'flush' | 'delim' | 'response-end';
   payload: Buffer;
@@ -171,7 +181,7 @@ function parsePktLines(buf: Buffer): PktPacket[] {
   while (off < buf.length) {
     if (off + 4 > buf.length) throw new Error('truncated pkt-line length');
     const hex = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error('bad pkt-line length');
+    if (!isHex4(hex)) throw new Error('bad pkt-line length');
     const len = parseInt(hex, 16);
     if (len === 0) {
       out.push({ kind: 'flush', payload: Buffer.alloc(0) });
@@ -354,6 +364,18 @@ function readPack(pack: Buffer, resolveBase?: (oid: string) => GitObject | undef
     offset = inflated.next;
     raw.push(entry);
     byOffset.set(entryOffset, entry);
+  }
+  // Fast path: packs without delta entries resolve trivially (no base lookups,
+  // no resolve recursion). Push packs are always plain, so this is the hot path.
+  let hasDelta = false;
+  for (const entry of raw) {
+    if (entry.typeCode === 6 || entry.typeCode === 7) { hasDelta = true; break; }
+  }
+  if (!hasDelta) {
+    return raw.map((entry) => {
+      const type = CODE_TYPE[entry.typeCode] as GitObjectType;
+      return { type, data: entry.data, oid: hashObject(type, entry.data) };
+    });
   }
   const resolvedByOid = new Map<string, Raw>();
   const resolving = new Set<number>();
@@ -688,6 +710,12 @@ interface Repo {
   createdSec: number;
   version: number;
   packCache: Map<string, Buffer>;
+  /** Bumped on every mutation of any issue in this repo; validates issueJsonCache. */
+  issueRev: number;
+  /** Serialized GET /issues/{n} response bodies, keyed by issue number. */
+  issueJsonCache: Map<number, { rev: number; body: Buffer }>;
+  /** Serialized v0 ref advertisements, keyed by service. */
+  advCache: Map<string, { version: number; branch: string; body: Buffer }>;
 }
 
 let nextRepoId = 10000;
@@ -723,6 +751,9 @@ function createRepoRecord(name: string, description: string, isPrivate: boolean)
     createdSec,
     version: 0,
     packCache: new Map(),
+    issueRev: 0,
+    issueJsonCache: new Map(),
+    advCache: new Map(),
   };
   repos.set(repoKey(VIEWER_LOGIN, name), repo);
   return repo;
@@ -872,6 +903,17 @@ function sendJson(res: ServerResponse, status: number, body: unknown, extraHeade
   }
   res.writeHead(status, headers);
   res.end(text);
+}
+/** Send an already-serialized JSON body (no stringify, no byte-length scan). */
+function sendJsonBuffer(res: ServerResponse, status: number, body: Buffer, extraHeaders: Record<string, string> = {}): void {
+  const headers: Record<string, string> = {
+    'x-github-request-id': nextRequestId(),
+    ...extraHeaders,
+    'content-type': JSON_TYPE,
+    'content-length': String(body.length),
+  };
+  res.writeHead(status, headers);
+  res.end(body);
 }
 function sendError(res: ServerResponse, status: number, message: string): void {
   sendJson(res, status, { message });
@@ -1069,13 +1111,11 @@ function linkHeader(req: IncomingMessage, path: string, query: URLSearchParams, 
 // ---------------------------------------------------------------------------
 // REST router
 
-async function handleRest(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-  const rawPath = pathOf(req);
+async function handleRest(req: IncomingMessage, res: ServerResponse, rawPath: string = pathOf(req), query: URLSearchParams = queryOf(req)): Promise<boolean> {
   if (!rawPath.startsWith('/api/v3')) return false;
   const method = req.method ?? 'GET';
   const path = decodePath(rawPath);
   const sub = path === '/api/v3' ? '/' : path.slice('/api/v3'.length);
-  const query = queryOf(req);
 
   if (!authOk(req)) {
     sendError(res, 401, 'Requires authentication');
@@ -1360,6 +1400,7 @@ async function handleRepoRest(req: IncomingMessage, res: ServerResponse, repo: R
         };
         nextCommentCounter += 1;
         issue.comments.push(comment);
+        repo.issueRev += 1;
         sendJson(res, 201, commentJson(repo, issue, comment));
         return true;
       }
@@ -1367,7 +1408,14 @@ async function handleRepoRest(req: IncomingMessage, res: ServerResponse, repo: R
       return true;
     }
     if (method === 'GET') {
-      sendJson(res, 200, issueJson(repo, issue));
+      const cached = repo.issueJsonCache.get(number);
+      if (cached && cached.rev === repo.issueRev) {
+        sendJsonBuffer(res, 200, cached.body);
+        return true;
+      }
+      const body = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+      repo.issueJsonCache.set(number, { rev: repo.issueRev, body });
+      sendJsonBuffer(res, 200, body);
       return true;
     }
     if (method === 'PATCH') {
@@ -1380,6 +1428,7 @@ async function handleRepoRest(req: IncomingMessage, res: ServerResponse, repo: R
       if (typeof body.title === 'string') issue.title = body.title;
       if (typeof body.body === 'string') issue.body = body.body;
       if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
+      repo.issueRev += 1;
       sendJson(res, 200, issueJson(repo, issue));
       return true;
     }
@@ -1459,6 +1508,7 @@ async function createIssueRest(req: IncomingMessage, res: ServerResponse, repo: 
   };
   nextIssueId += 1;
   repo.issues.push(issue);
+  repo.issueRev += 1;
   sendJson(res, 201, issueJson(repo, issue));
   return true;
 }
@@ -2290,6 +2340,7 @@ function mutateCreateIssue(selection: GqlSelection, ctx: GqlContext): Record<str
   };
   nextIssueId += 1;
   repo.issues.push(issue);
+  repo.issueRev += 1;
   return { __gqlType: 'CreateIssuePayload', issue: wrapIssue(repo, issue) };
 }
 function mutateCloseIssue(selection: GqlSelection, ctx: GqlContext): Record<string, unknown> {
@@ -2300,6 +2351,7 @@ function mutateCloseIssue(selection: GqlSelection, ctx: GqlContext): Record<stri
     return { __gqlType: 'CloseIssuePayload', issue: null };
   }
   found.issue.state = 'closed';
+  found.repo.issueRev += 1;
   return { __gqlType: 'CloseIssuePayload', issue: wrapIssue(found.repo, found.issue) };
 }
 function mutateCreatePullRequest(selection: GqlSelection, ctx: GqlContext): Record<string, unknown> {
@@ -2366,6 +2418,7 @@ function mutateAddComment(selection: GqlSelection, ctx: GqlContext): Record<stri
   };
   nextCommentCounter += 1;
   found.issue.comments.push(comment);
+  found.repo.issueRev += 1;
   return {
     __gqlType: 'AddCommentPayload',
     commentEdge: { __gqlType: 'IssueCommentEdge', node: { __gqlType: 'IssueComment', id: comment.globalId, body: comment.body } },
@@ -2385,8 +2438,8 @@ function executeGraphQLOperation(query: string, variables: Record<string, unknow
   }
 }
 
-async function handleGraphQL(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-  if (pathOf(req) !== '/api/graphql') return false;
+async function handleGraphQL(req: IncomingMessage, res: ServerResponse, path: string = pathOf(req)): Promise<boolean> {
+  if (path !== '/api/graphql') return false;
   if ((req.method ?? 'GET') !== 'POST') {
     sendError(res, 404, 'Not Found');
     return true;
@@ -2582,6 +2635,7 @@ function mcpCallTool(name: string, args: Record<string, unknown>): { result?: Re
       };
       nextIssueId += 1;
       repo.issues.push(issue);
+      repo.issueRev += 1;
       return { result: mcpToolResult(issueJson(repo, issue)) };
     }
     case 'list_issues': {
@@ -2659,8 +2713,8 @@ function mcpSend(res: ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 
-async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-  if (pathOf(req) !== '/mcp') return false;
+async function handleMcp(req: IncomingMessage, res: ServerResponse, path: string = pathOf(req)): Promise<boolean> {
+  if (path !== '/mcp') return false;
   const method = req.method ?? 'GET';
   if (method === 'DELETE') {
     res.writeHead(204);
@@ -2786,15 +2840,13 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(parts);
 }
 
+/** The v2 capability advertisement never changes: precompute it once. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  ...['version 2', 'ls-refs=unborn', 'fetch=shallow wait-for-done', 'object-format=sha1', 'agent=gitforge/1.0'].map((line) => pktLine(`${line}\n`)),
+  PKT_FLUSH,
+]);
 function v2Advertisement(): Buffer {
-  const lines = [
-    'version 2',
-    'ls-refs=unborn',
-    'fetch=shallow wait-for-done',
-    'object-format=sha1',
-    'agent=gitforge/1.0',
-  ];
-  return Buffer.concat([...lines.map((line) => pktLine(`${line}\n`)), PKT_FLUSH]);
+  return V2_ADVERTISEMENT;
 }
 
 function sendGit(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
@@ -2835,8 +2887,11 @@ function fetchObjects(repo: Repo, wants: readonly string[], haves: readonly stri
   }
   const queue: WalkItem[] = wants.map((oid) => ({ oid, depth: 0 }));
   const seenCommits = new Set<string>();
-  while (queue.length) {
-    const item = queue.shift() as WalkItem;
+  // Index pointer instead of queue.shift(): shift() is O(n) per pop, O(n^2) over a
+  // 200-commit walk. The order is identical (FIFO from the front).
+  let queueHead = 0;
+  while (queueHead < queue.length) {
+    const item = queue[queueHead++] as WalkItem;
     const obj = repo.objects.get(item.oid);
     if (!obj) continue;
     if (obj.type === 'tag') {
@@ -3006,7 +3061,7 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
     let off = 0;
     while (off + 4 <= body.length) {
       const hex = body.subarray(off, off + 4).toString('ascii');
-      if (!/^[0-9a-fA-F]{4}$/.test(hex)) return -1;
+      if (!isHex4(hex)) return -1;
       const len = parseInt(hex, 16);
       if (len === 0) return off + 4;
       if (len < 4 || off + len > body.length) return -1;
@@ -3106,8 +3161,16 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
   return Buffer.concat([pktLine(Buffer.concat([Buffer.from([1]), report])), PKT_FLUSH]);
 }
 
-async function handleGit(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
-  const rawPath = pathOf(req);
+/** The v0 ref advertisement, cached per repo version + default branch (refs drive it). */
+function cachedV0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const cached = repo.advCache.get(service);
+  if (cached && cached.version === repo.version && cached.branch === repo.defaultBranch) return cached.body;
+  const body = v0Advertisement(repo, service);
+  repo.advCache.set(service, { version: repo.version, branch: repo.defaultBranch, body });
+  return body;
+}
+
+async function handleGit(req: IncomingMessage, res: ServerResponse, rawPath: string = pathOf(req), query: URLSearchParams = queryOf(req)): Promise<boolean> {
   const gitMatch = /^\/([^/]+)\/([^/]+)\.git(\/.*)$/.exec(rawPath);
   if (!gitMatch) return false;
   const owner = decodePath(gitMatch[1] as string);
@@ -3124,7 +3187,6 @@ async function handleGit(req: IncomingMessage, res: ServerResponse): Promise<boo
       sendError(res, 405, 'Method Not Allowed');
       return true;
     }
-    const query = queryOf(req);
     const service = query.get('service') ?? '';
     if (!repo) {
       sendError(res, 404, 'Not Found');
@@ -3133,11 +3195,11 @@ async function handleGit(req: IncomingMessage, res: ServerResponse): Promise<boo
     if (service === 'git-upload-pack') {
       const wantsV2 = req.headers['git-protocol'] === 'version=2';
       if (wantsV2) sendGit(res, 200, 'application/x-git-upload-pack-advertisement', v2Advertisement());
-      else sendGit(res, 200, 'application/x-git-upload-pack-advertisement', v0Advertisement(repo, 'git-upload-pack'));
+      else sendGit(res, 200, 'application/x-git-upload-pack-advertisement', cachedV0Advertisement(repo, 'git-upload-pack'));
       return true;
     }
     if (service === 'git-receive-pack') {
-      sendGit(res, 200, 'application/x-git-receive-pack-advertisement', v0Advertisement(repo, 'git-receive-pack'));
+      sendGit(res, 200, 'application/x-git-receive-pack-advertisement', cachedV0Advertisement(repo, 'git-receive-pack'));
       return true;
     }
     sendError(res, 404, 'Not Found');
@@ -3177,15 +3239,24 @@ async function handleGit(req: IncomingMessage, res: ServerResponse): Promise<boo
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   try {
-    const path = pathOf(req);
+    // Parse the request URL once; every handler below reuses it (was 3-4 parses).
+    let path = '/';
+    let query = new URLSearchParams();
+    try {
+      const url = new URL(req.url ?? '/', 'http://entry');
+      path = url.pathname;
+      query = url.searchParams;
+    } catch {
+      // keep the defaults
+    }
     if (req.method === 'GET' && path === '/healthz') {
       sendJson(res, 200, { ok: true });
       return;
     }
-    if (await handleGit(req, res)) return;
-    if (await handleRest(req, res)) return;
-    if (await handleGraphQL(req, res)) return;
-    if (await handleMcp(req, res)) return;
+    if (await handleGit(req, res, path, query)) return;
+    if (await handleRest(req, res, path, query)) return;
+    if (await handleGraphQL(req, res, path)) return;
+    if (await handleMcp(req, res, path)) return;
     sendError(res, 404, 'Not Found');
   } catch (err) {
     if (!res.headersSent) {
